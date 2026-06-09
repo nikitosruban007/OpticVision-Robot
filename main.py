@@ -1,116 +1,100 @@
+import sys
 import time
+
 import cv2
-import numpy as np
-from robot import RobotInterface
-from vision import LineTracker
 
-IP = "192.168.4.1"
-MAX_SPEED = 255
-TURN_SPEED = 135
-SEARCH_SPEED = 100
-DEADZONE = 40
+import config
+import vision
+from camera import VideoStream
+from controller import Controller
+from robot import RobotClient
 
 
-def run():
-    bot = RobotInterface(IP)
-    vision = LineTracker()
+def draw_debug(frame, res, command, fps, elapsed):
+    h, w = frame.shape[:2]
+    for roi, color in ((config.ROI_NEAR, (0, 255, 0)), (config.ROI_FAR, (0, 180, 255))):
+        y0, y1 = int(roi[0] * h), int(roi[1] * h)
+        cv2.rectangle(frame, (0, y0), (w - 1, y1), color, 1)
+    cv2.line(frame, (w // 2, 0), (w // 2, h), (120, 120, 120), 1)
+    ny = int((config.ROI_NEAR[0] + config.ROI_NEAR[1]) / 2 * h)
+    if res.near_x is not None:
+        cv2.circle(frame, (int(res.near_x), ny), 6, (0, 0, 255), -1)
+    if res.near_x is not None and res.far_x is not None:
+        fy = int((config.ROI_FAR[0] + config.ROI_FAR[1]) / 2 * h)
+        cv2.arrowedLine(frame, (int(res.near_x), ny), (int(res.far_x), fy),
+                        (0, 255, 255), 2, tipLength=0.25)
+    txt = (f"cmd={command} lat={res.error:+.2f} head={res.heading_error:+.2f} "
+           f"fps={fps:4.1f} t={elapsed:5.1f}s")
+    if res.is_junction:
+        txt += " [junction]"
+    if res.is_startfinish:
+        txt += " [START/FINISH]"
+    cv2.putText(frame, txt, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.imshow("line-tracker", frame)
 
-    bot.start()
-    time.sleep(1)
 
-    current_speed = MAX_SPEED
-    bot.set_speed(current_speed)
-    last_err = 0
+def main():
+    ip = sys.argv[1] if len(sys.argv) > 1 else None
+    robot = RobotClient(ip).connect()
+    cam = VideoStream(robot.ip).start()
+    ctrl = Controller(robot)
 
-    is_running = False
-    show_video = True
+    started = False
+    start_t = None
+    last_frame_id = -1
+    predicted_x = None
+    period = 1.0 / config.CONTROL_HZ
+    boot_t = time.time()
 
-    blank_screen = np.zeros((150, 400, 3), dtype=np.uint8)
-    cv2.putText(blank_screen, "VIDEO DISABLED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    cv2.putText(blank_screen, "Press 'V' to enable video", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    cv2.putText(blank_screen, "G: GO | S: STOP | Q: QUIT", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
+    print("[main] поїхали. q/Esc — стоп.")
     try:
         while True:
-            frame = bot.get_frame()
+            tick = time.time()
+            fid, frame = cam.read()
             if frame is None:
+                robot.move("forward")
+                time.sleep(period)
                 continue
 
-            err, found, debug_frame = vision.process(frame, debug=show_video)
-            current_action = "STOP"
+            if fid != last_frame_id:
+                last_frame_id = fid
+                res = vision.analyze(frame, predicted_x)
+                predicted_x = res.near_x if res.near_x is not None else predicted_x
+            command = "forward"
 
-            if is_running:
-                if found:
-                    last_err = err
-                    if abs(err) <= DEADZONE:
-                        if current_speed != MAX_SPEED:
-                            current_speed = MAX_SPEED
-                            bot.set_speed(current_speed)
-                        bot.move("forward")
-                        current_action = "FORWARD"
-                    elif err < -DEADZONE:
-                        if current_speed != TURN_SPEED:
-                            current_speed = TURN_SPEED
-                            bot.set_speed(current_speed)
-                        bot.move("left")
-                        current_action = "LEFT"
-                    else:
-                        if current_speed != TURN_SPEED:
-                            current_speed = TURN_SPEED
-                            bot.set_speed(current_speed)
-                        bot.move("right")
-                        current_action = "RIGHT"
-                else:
-                    if current_speed != SEARCH_SPEED:
-                        current_speed = SEARCH_SPEED
-                        bot.set_speed(current_speed)
-                    if last_err < 0:
-                        bot.move("left")
-                        current_action = "SEARCH LEFT"
-                    else:
-                        bot.move("right")
-                        current_action = "SEARCH RIGHT"
+            elapsed = (time.time() - start_t) if start_t else 0.0
+
+            since_boot = time.time() - boot_t
+            if res.is_startfinish and since_boot > config.STARTLINE_IGNORE_S:
+                if not started:
+                    started = True
+                    start_t = time.time()
+                    print("[main] СТАРТ — таймер пішов")
+                elif elapsed > 3.0:
+                    robot.stop()
+                    print(f"[main] ФІНІШ. Час: {elapsed:.2f} с")
+                    break
+
+            if res.found:
+                command = ctrl.follow(res.error, res.heading_error)
             else:
-                bot.move("stop")
+                if not ctrl.recover():
+                    print("[main] лінію не вдалось повернути вчасно — стоп")
+                    robot.stop()
+                    break
 
-            if show_video and debug_frame is not None:
-                if not is_running:
-                    cv2.putText(debug_frame, "PAUSED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.putText(debug_frame, "V: Video | G: Go | S: Stop", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                (0, 255, 255), 1)
-                else:
-                    cv2.putText(debug_frame, f"ACT: {current_action}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                (0, 255, 0), 2)
-                    cv2.putText(debug_frame, f"ERR: {err}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    cv2.putText(debug_frame, f"SPD: {current_speed}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                (255, 255, 255), 1)
+            if config.SHOW_DEBUG:
+                draw_debug(frame, res, command, cam.fps, elapsed)
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    print("[main] ручна зупинка")
+                    break
 
-                cv2.imshow("KPI Robot", debug_frame)
-            else:
-                temp_blank = blank_screen.copy()
-                status_color = (0, 255, 0) if is_running else (0, 0, 255)
-                status_text = "RUNNING" if is_running else "PAUSED"
-                cv2.putText(temp_blank, f"STATE: {status_text}", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color,
-                            2)
-
-                cv2.imshow("KPI Robot", temp_blank)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('g'):
-                is_running = True
-            elif key == ord('s'):
-                is_running = False
-            elif key == ord('v'):
-                show_video = not show_video
-
-    except KeyboardInterrupt:
-        pass
+            time.sleep(max(0.0, period - (time.time() - tick)))
     finally:
-        bot.stop()
+        robot.close()
+        cam.stop()
         cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    run()
+    main()

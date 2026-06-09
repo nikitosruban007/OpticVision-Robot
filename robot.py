@@ -1,81 +1,117 @@
-import websocket
+import json
+import socket
 import threading
 import time
-import requests
-import cv2
+
+from websocket import create_connection
+
+import config
 
 
-class RobotInterface:
-    def __init__(self, ip):
-        self.ip = ip
-        self.ws_url = f"ws://{ip}/ws"
-        self.action_url = f"http://{ip}/action"
-        self.stream_url = f"http://{ip}:81/stream"
-        self.ws = None
-        self.current_command = "stop"
-        self.speed = 170
-        self.running = False
-        self.lock = threading.Lock()
-        self.cap = None
-        self.latest_frame = None
-
-    def start(self):
-        self.ws = websocket.create_connection(self.ws_url, timeout=2)
-        self.ws.send("ping")
-        self.running = True
-        threading.Thread(target=self._heartbeat, daemon=True).start()
-
-        self.cap = cv2.VideoCapture(self.stream_url)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        threading.Thread(target=self._video_loop, daemon=True).start()
-
-    def _heartbeat(self):
-        while self.running:
-            with self.lock:
-                cmd = self.current_command
-            if cmd != "stop":
-                try:
-                    self.ws.send(cmd)
-                except:
-                    pass
-            time.sleep(0.15)
-
-    def _video_loop(self):
-        while self.running and self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if ret:
-                with self.lock:
-                    self.latest_frame = frame
-            else:
-                time.sleep(0.01)
-
-    def get_frame(self):
-        with self.lock:
-            return self.latest_frame.copy() if self.latest_frame is not None else None
-
-    def set_speed(self, speed):
-        self.speed = max(85, min(255, int(speed)))
-        try:
-            self.ws.send(f"speed:{self.speed}")
-        except:
-            pass
-
-    def move(self, cmd):
-        with self.lock:
-            self.current_command = cmd
-        if cmd == "stop":
+def discover_robot(timeout=config.DISCOVERY_TIMEOUT, port=config.DISCOVERY_PORT):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(timeout)
+    sock.bind(("", port))
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
             try:
-                self.ws.send("stop")
-            except:
+                data, _ = sock.recvfrom(1024)
+            except socket.timeout:
+                break
+            text = data.decode("utf-8", "ignore")
+            if not text.startswith("KPI_ROBOT_CAR"):
+                continue
+            fields = dict(
+                part.split("=", 1)
+                for part in text.split(";")
+                if "=" in part
+            )
+            ip = fields.get("ip")
+            if ip:
+                print(f"[robot] знайдено {fields.get('name', '?')} @ {ip}")
+                return ip
+    finally:
+        sock.close()
+    return None
+
+
+class RobotClient:
+    def __init__(self, ip=None):
+        self.ip = ip or config.ROBOT_IP or discover_robot()
+        if not self.ip:
+            raise RuntimeError("Робота не знайдено. Вкажи ROBOT_IP у config.py.")
+        self.ws = None
+        self._send_lock = threading.Lock()
+        self._last_status = {}
+        self._draining = False
+        self._current_speed = None
+        self._last_cmd = None
+
+    # --- з'єднання ----------------------------------------------------------
+    def connect(self):
+        url = f"ws://{self.ip}:{config.WS_PORT}/ws"
+        self.ws = create_connection(url, timeout=3)
+        self._start_drain()
+        self.set_speed(config.SPEED_STRAIGHT)
+        return self
+
+    def _start_drain(self):
+        self._draining = True
+
+        def loop():
+            while self._draining:
                 try:
-                    requests.get(self.action_url, params={"go": "stop"}, timeout=0.5)
-                except:
-                    pass
+                    msg = self.ws.recv()
+                except Exception:
+                    break
+                if isinstance(msg, str) and msg.startswith("{"):
+                    try:
+                        self._last_status = json.loads(msg)
+                    except ValueError:
+                        pass
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    # --- надсилання ---------------------------------------------------------
+    def _send(self, text):
+        with self._send_lock:
+            self.ws.send(text)
+
+    def move(self, command):
+        self._send(command)
+        self._last_cmd = command
+
+    def set_speed(self, value):
+        value = max(config.SPEED_MIN, min(config.SPEED_MAX, int(value)))
+        if (self._current_speed is None
+                or abs(value - self._current_speed) >= config.SPEED_SEND_DELTA):
+            self._send(f"speed:{value}")
+            self._current_speed = value
+
+    def led(self, on):
+        self._send("led:on" if on else "led:off")
 
     def stop(self):
-        self.running = False
         self.move("stop")
-        if self.ws:
-            self.ws.close()
-        if self.cap:
-            self.cap.release()
+
+    @property
+    def status(self):
+        return dict(self._last_status)
+
+    def close(self):
+        self._draining = False
+        try:
+            if self.ws:
+                self.stop()
+                time.sleep(0.05)
+                self.ws.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, *exc):
+        self.close()

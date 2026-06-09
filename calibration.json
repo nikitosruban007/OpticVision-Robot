@@ -1,0 +1,7 @@
+{
+  "LINE_IS_DARK": true,
+  "THRESHOLD_METHOD": "otsu",
+  "BLUR_KSIZE": 5,
+  "CENTER_OFFSET": 1.7,
+  "MIN_CONTRAST": 31
+}
