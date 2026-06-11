@@ -134,7 +134,7 @@ def save(offsets, fills, polar, multi, n, contrasts=None):
     }
     if contrasts:
         med_c = float(np.median(contrasts))
-        calib["MIN_CONTRAST"] = int(max(18, min(60, med_c * 0.5)))
+        calib["MIN_CONTRAST"] = int(max(15, min(45, med_c * 0.4)))
     with open(CALIB_PATH, "w", encoding="utf-8") as f:
         json.dump(calib, f, ensure_ascii=False, indent=2)
 

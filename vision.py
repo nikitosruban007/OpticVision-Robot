@@ -1,3 +1,16 @@
+"""Зір: кадр -> нормалізована похибка [-1, 1] + прапорці (перехрестя, старт/фініш).
+
+Ключові виправлення проти "відхиляється від лінії":
+- Поріг (Otsu) рахується ТІЛЬКИ по нижній робочій частині кадру. Камера
+  дивиться високо — стеля/глейр у верхній половині зміщували поріг Otsu.
+- Сегменти фільтруються за ШИРИНОЮ: тінь робота і букви банера на підлозі
+  ("ROBOVISION JUNIOR LEAGUE") більше не приймаються за лінію.
+- Якщо ближня смуга залита (>MAX_BAND_FILL) і це не старт/фініш — кадр
+  ненадійний (тінь накрила смугу), а не "лінія тут".
+- Якщо лінія зникла з ближньої смуги (крутий поворот), кермуємо по дальній
+  смузі (far-only fallback) замість миттєвого "lost".
+"""
+
 from dataclasses import dataclass, field
 
 import cv2
@@ -15,8 +28,10 @@ class VisionResult:
     far_x: float = None
     is_junction: bool = False
     is_startfinish: bool = False
+    far_only: bool = False
     width: int = 0
     mask: object = field(default=None, repr=False)
+    mask_y0: int = 0
 
 
 def _binarize(gray):
@@ -45,12 +60,19 @@ def _binarize(gray):
 
 
 def _band_segments(band):
+    """Сегменти-кандидати у смузі. Відсікаємо і занадто малі (шум),
+    і занадто ШИРОКІ (тінь робота, банер, заливка) об'єкти."""
+    h, w = band.shape
+    max_w = getattr(config, "MAX_SEGMENT_WIDTH_FRAC", 0.65) * w
     contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     segments = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < config.MIN_LINE_AREA:
             continue
+        _, _, bw, _ = cv2.boundingRect(c)
+        if bw > max_w:
+            continue  # тінь / банер / пляма на пів смуги — не лінія
         m = cv2.moments(c)
         if m["m00"] == 0:
             continue
@@ -86,12 +108,17 @@ def _band_contrast(gray_band, mask_band):
 
 def analyze(frame, predicted_x=None):
     h, w = frame.shape[:2]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Працюємо лише з нижньою частиною кадру (від верху ROI_FAR і нижче):
+    # стеля/глейр більше не псують поріг Otsu, і це ще й швидше.
+    y_top = int(min(config.ROI_FAR[0], config.ROI_NEAR[0]) * h)
+    work = frame[y_top:, :]
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
     mask = _binarize(gray)
 
     def slab(roi):
-        y0 = int(roi[0] * h)
-        y1 = int(roi[1] * h)
+        y0 = max(int(roi[0] * h) - y_top, 0)
+        y1 = max(int(roi[1] * h) - y_top, y0 + 1)
         return mask[y0:y1, :], gray[y0:y1, :]
 
     near_mask, near_gray = slab(config.ROI_NEAR)
@@ -100,34 +127,58 @@ def analyze(frame, predicted_x=None):
     near_segs = _band_segments(near_mask)
     far_segs = _band_segments(far_mask)
 
-    res = VisionResult(width=w, mask=mask)
+    res = VisionResult(width=w, mask=mask, mask_y0=y_top)
     res.is_startfinish = _is_startfinish(near_mask)
     res.is_junction = len(near_segs) >= 2 or len(far_segs) >= 2
 
     min_contrast = getattr(config, "MIN_CONTRAST", 35)
-    near_contrast = _band_contrast(near_gray, near_mask)
-    if not near_segs or near_contrast < min_contrast:
+    max_fill = getattr(config, "MAX_BAND_FILL", 0.55)
+    near_fill = float((near_mask > 0).mean())
+    near_ok = (bool(near_segs)
+               and _band_contrast(near_gray, near_mask) >= min_contrast
+               and (near_fill <= max_fill or res.is_startfinish))
+
+    far_ok = bool(far_segs) and _band_contrast(far_gray, far_mask) >= min_contrast
+    far_x = None
+    if far_ok:
+        far_x = _pick_segment(
+            far_segs,
+            predicted_x if predicted_x is not None
+            else (_pick_segment(near_segs, None) if near_ok else None))
+    res.far_x = far_x
+
+    center = w / 2.0 + getattr(config, "CENTER_OFFSET", 0.0)
+
+    if not near_ok:
+        # Far-only fallback: на крутому повороті лінія першою виходить з
+        # ближньої смуги — кермуємо по дальній, не падаючи у recovery.
+        if far_x is not None:
+            res.found = True
+            res.far_only = True
+            err_far = (far_x - center) / (w / 2.0)
+            gain = getattr(config, "FAR_ONLY_GAIN", 0.8)
+            res.error = float(np.clip(gain * err_far, -1.0, 1.0))
+            res.heading_error = 0.0
+            return res
         res.found = False
         return res
 
     near_x = _pick_segment(near_segs, predicted_x)
     res.near_x = near_x
-
-    far_x = None
-    if far_segs and _band_contrast(far_gray, far_mask) >= min_contrast:
-        far_x = _pick_segment(far_segs, predicted_x if predicted_x is not None else near_x)
-    res.far_x = far_x
-
     if near_x is None:
         res.found = False
         return res
 
-    center = w / 2.0 + getattr(config, "CENTER_OFFSET", 0.0)
     err_near = (near_x - center) / (w / 2.0)
     err_far = (far_x - center) / (w / 2.0) if far_x is not None else err_near
     res.found = True
-    res.error = (config.ROI_WEIGHT_NEAR * err_near
-                 + config.ROI_WEIGHT_FAR * err_far)
+    far_weight = config.ROI_WEIGHT_FAR
+    if (far_x is not None
+            and err_near * err_far < 0
+            and abs(err_near) >= getattr(config, "OPPOSITE_FAR_LOCK_ERROR", 0.12)):
+        far_weight *= getattr(config, "OPPOSITE_FAR_SCALE", 0.15)
+    near_weight = 1.0 - far_weight
+    res.error = (near_weight * err_near + far_weight * err_far)
     res.error = float(np.clip(res.error, -1.0, 1.0))
 
     max_dx_frac = getattr(config, "HEADING_MAX_DX_FRAC", 0.45)
